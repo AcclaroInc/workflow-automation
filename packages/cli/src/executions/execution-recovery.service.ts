@@ -1,22 +1,29 @@
-import Container, { Service } from 'typedi';
-import { Push } from '@/push';
-import { jsonStringify, sleep } from 'n8n-workflow';
-import { ExecutionRepository } from '@db/repositories/execution.repository';
-import { getWorkflowHooksMain } from '@/WorkflowExecuteAdditionalData'; // @TODO: Dependency cycle
-import { InternalHooks } from '@/InternalHooks'; // @TODO: Dependency cycle if injected
+import { Logger } from '@n8n/backend-common';
+import { ExecutionsConfig } from '@n8n/config';
+import {
+	In,
+	type IExecutionResponse,
+	ProjectRelationRepository,
+	WorkflowEntity,
+	User,
+} from '@n8n/db';
+import { ExecutionRepository, WorkflowRepository } from '@n8n/db';
+import { Service } from '@n8n/di';
+import { PROJECT_ADMIN_ROLE_SLUG, PROJECT_OWNER_ROLE_SLUG } from '@n8n/permissions';
 import type { DateTime } from 'luxon';
-import type { IRun, ITaskData } from 'n8n-workflow';
-import type { EventMessageTypes } from '../eventbus/EventMessageClasses';
-import type { IExecutionResponse } from '@/Interfaces';
+import { InstanceSettings } from 'n8n-core';
+import { createEmptyRunExecutionData, sleep } from 'n8n-workflow';
+import { ExecutionStatus, type IRun, type ITaskData } from 'n8n-workflow';
+
+import { ARTIFICIAL_TASK_DATA } from '@/constants';
 import { NodeCrashedError } from '@/errors/node-crashed.error';
 import { WorkflowCrashedError } from '@/errors/workflow-crashed.error';
-import { ARTIFICIAL_TASK_DATA } from '@/constants';
-import { Logger } from '@/Logger';
-import config from '@/config';
-import { OnShutdown } from '@/decorators/OnShutdown';
-import type { QueueRecoverySettings } from './execution.types';
-import { OrchestrationService } from '@/services/orchestration.service';
-import { EventRelay } from '@/eventbus/event-relay.service';
+import { getLifecycleHooksForRegularMain } from '@/execution-lifecycle/execution-lifecycle-hooks';
+import { Push } from '@/push';
+import { OwnershipService } from '@/services/ownership.service';
+import { UserManagementMailer } from '@/user-management/email/user-management-mailer';
+
+import type { EventMessageTypes } from '../eventbus/event-message-classes';
 
 /**
  * Service for recovering key properties in executions.
@@ -25,41 +32,71 @@ import { EventRelay } from '@/eventbus/event-relay.service';
 export class ExecutionRecoveryService {
 	constructor(
 		private readonly logger: Logger,
+		private readonly instanceSettings: InstanceSettings,
 		private readonly push: Push,
 		private readonly executionRepository: ExecutionRepository,
-		private readonly orchestrationService: OrchestrationService,
-		private readonly eventRelay: EventRelay,
+		private readonly executionsConfig: ExecutionsConfig,
+		private readonly workflowRepository: WorkflowRepository,
+		private readonly userManagementMailer: UserManagementMailer,
+		private readonly ownershipService: OwnershipService,
+		private readonly projectRelationRepository: ProjectRelationRepository,
 	) {}
 
-	/**
-	 * @important Requires `OrchestrationService` to be initialized on queue mode.
-	 */
-	init() {
-		if (config.getEnv('executions.mode') === 'regular') return;
+	async autoDeactivateWorkflowsIfNeeded(workflowIds: Set<string>) {
+		for (const workflowId of workflowIds) {
+			const maxLastExecutions = this.executionsConfig.recovery.maxLastExecutions;
+			const lastExecutions = await this.executionRepository.findMultipleExecutions({
+				select: ['id', 'status'],
+				where: { workflowId },
+				order: { startedAt: 'DESC' },
+				take: maxLastExecutions,
+			});
+			const numberOfCrashedExecutions = lastExecutions.filter((e) => e.status === 'crashed').length;
 
-		const { isLeader, isMultiMainSetupEnabled } = this.orchestrationService;
+			// If all of the last N executions are crashed, deactivate the workflow
+			if (
+				lastExecutions.length >= maxLastExecutions &&
+				lastExecutions.length === numberOfCrashedExecutions
+			) {
+				// Get workflow to preserve existing meta
+				const workflow = await this.workflowRepository.findOne({ where: { id: workflowId } });
 
-		if (isLeader) this.scheduleQueueRecovery();
+				if (!workflow) {
+					this.logger.warn(`Workflow ${workflowId} not found, skipping workflow auto-deactivation`);
+					continue;
+				}
 
-		if (isMultiMainSetupEnabled) {
-			this.orchestrationService.multiMainSetup
-				.on('leader-takeover', () => this.scheduleQueueRecovery())
-				.on('leader-stepdown', () => this.stopQueueRecovery());
+				if (workflow.activeVersionId !== null) {
+					await this.workflowRepository.updateActiveState(workflowId, false);
+					this.logger.warn(
+						`Autodeactivated workflow ${workflowId} due to too many crashed executions.`,
+					);
+
+					const recipient = await this.getAutodeactivationRecipient(workflow);
+					await this.userManagementMailer.notifyWorkflowAutodeactivated({
+						recipient,
+						workflow,
+					});
+
+					this.push.once('editorUiConnected', async () => {
+						await sleep(1000);
+						this.push.broadcast({ type: 'workflowAutoDeactivated', data: { workflowId } });
+					});
+				}
+
+				await this.executionRepository.update(
+					{ workflowId, status: In<ExecutionStatus>(['running', 'new']) },
+					{ status: 'crashed', stoppedAt: new Date() },
+				);
+			}
 		}
 	}
-
-	private readonly queueRecoverySettings: QueueRecoverySettings = {
-		batchSize: config.getEnv('executions.queueRecovery.batchSize'),
-		waitMs: config.getEnv('executions.queueRecovery.interval') * 60 * 1000,
-	};
-
-	private isShuttingDown = false;
 
 	/**
 	 * Recover key properties of a truncated execution using event logs.
 	 */
 	async recoverFromLogs(executionId: string, messages: EventMessageTypes[]) {
-		if (this.orchestrationService.isFollower) return;
+		if (this.instanceSettings.isFollower) return;
 
 		const amendedExecution = await this.amend(executionId, messages);
 
@@ -75,92 +112,15 @@ export class ExecutionRecoveryService {
 
 		this.push.once('editorUiConnected', async () => {
 			await sleep(1000);
-			this.push.broadcast('executionRecovered', { executionId });
+			this.push.broadcast({ type: 'executionRecovered', data: { executionId } });
 		});
 
 		return amendedExecution;
 	}
 
-	/**
-	 * Schedule a cycle to mark dangling executions as crashed in queue mode.
-	 */
-	scheduleQueueRecovery(waitMs = this.queueRecoverySettings.waitMs) {
-		if (!this.shouldScheduleQueueRecovery()) return;
-
-		this.queueRecoverySettings.timeout = setTimeout(async () => {
-			try {
-				const nextWaitMs = await this.recoverFromQueue();
-				this.scheduleQueueRecovery(nextWaitMs);
-			} catch (error) {
-				const msg = this.toErrorMsg(error);
-
-				this.logger.error('[Recovery] Failed to recover dangling executions from queue', { msg });
-				this.logger.error('[Recovery] Retrying...');
-
-				this.scheduleQueueRecovery();
-			}
-		}, waitMs);
-
-		const wait = [this.queueRecoverySettings.waitMs / (60 * 1000), 'min'].join(' ');
-
-		this.logger.debug(`[Recovery] Scheduled queue recovery check for next ${wait}`);
-	}
-
-	stopQueueRecovery() {
-		clearTimeout(this.queueRecoverySettings.timeout);
-	}
-
-	@OnShutdown()
-	shutdown() {
-		this.isShuttingDown = true;
-		this.stopQueueRecovery();
-	}
-
 	// ----------------------------------
 	//             private
 	// ----------------------------------
-
-	/**
-	 * Mark in-progress executions as `crashed` if stored in DB as `new` or `running`
-	 * but absent from the queue. Return time until next recovery cycle.
-	 */
-	private async recoverFromQueue() {
-		const { waitMs, batchSize } = this.queueRecoverySettings;
-
-		const storedIds = await this.executionRepository.getInProgressExecutionIds(batchSize);
-
-		if (storedIds.length === 0) {
-			this.logger.debug('[Recovery] Completed queue recovery check, no dangling executions');
-			return waitMs;
-		}
-
-		const { Queue } = await import('@/Queue');
-
-		const queuedIds = await Container.get(Queue).getInProgressExecutionIds();
-
-		if (queuedIds.size === 0) {
-			this.logger.debug('[Recovery] Completed queue recovery check, no dangling executions');
-			return waitMs;
-		}
-
-		const danglingIds = storedIds.filter((id) => !queuedIds.has(id));
-
-		if (danglingIds.length === 0) {
-			this.logger.debug('[Recovery] Completed queue recovery check, no dangling executions');
-			return waitMs;
-		}
-
-		await this.executionRepository.markAsCrashed(danglingIds);
-
-		this.logger.info('[Recovery] Completed queue recovery check, recovered dangling executions', {
-			danglingIds,
-		});
-
-		// if this cycle used up the whole batch size, it is possible for there to be
-		// dangling executions outside this check, so speed up next cycle
-
-		return storedIds.length >= this.queueRecoverySettings.batchSize ? waitMs / 2 : waitMs;
-	}
 
 	/**
 	 * Amend `status`, `stoppedAt`, and (if possible) `data` of an execution using event logs.
@@ -177,7 +137,17 @@ export class ExecutionRecoveryService {
 			unflattenData: true,
 		});
 
-		if (!execution || execution.status === 'success') return null;
+		/**
+		 * The event bus is unable to correctly identify unfinished executions in workers,
+		 * because execution lifecycle hooks cause worker event logs to be partitioned.
+		 * Hence we need to filter out finished executions here.
+		 * */
+		if (
+			!execution ||
+			(['success', 'error', 'canceled'].includes(execution.status) && execution.data)
+		) {
+			return null;
+		}
 
 		const runExecutionData = execution.data ?? { resultData: { runData: {} } };
 
@@ -190,12 +160,17 @@ export class ExecutionRecoveryService {
 
 			if (!nodeStartedMessage) continue;
 
+			const nodeHasRunData = runExecutionData.resultData.runData[node.name] !== undefined;
+
+			if (nodeHasRunData) continue; // when saving execution progress
+
 			const nodeFinishedMessage = nodeMessages.find(
 				(m) => m.payload.nodeName === node.name && m.eventName === 'n8n.node.finished',
 			);
 
 			const taskData: ITaskData = {
 				startTime: nodeStartedMessage.ts.toUnixInteger(),
+				executionIndex: 0,
 				executionTime: -1,
 				source: [null],
 			};
@@ -274,34 +249,16 @@ export class ExecutionRecoveryService {
 	}
 
 	private async runHooks(execution: IExecutionResponse) {
-		execution.data ??= { resultData: { runData: {} } };
+		execution.data ??= createEmptyRunExecutionData();
 
-		await Container.get(InternalHooks).onWorkflowPostExecute(execution.id, execution.workflowData, {
-			data: execution.data,
-			finished: false,
-			mode: execution.mode,
-			waitTill: execution.waitTill,
-			startedAt: execution.startedAt,
-			stoppedAt: execution.stoppedAt,
-			status: execution.status,
-		});
-
-		this.eventRelay.emit('workflow-post-execute', {
-			workflowId: execution.workflowData.id,
-			workflowName: execution.workflowData.name,
-			executionId: execution.id,
-			success: execution.status === 'success',
-			isManual: execution.mode === 'manual',
-		});
-
-		const externalHooks = getWorkflowHooksMain(
+		const lifecycleHooks = getLifecycleHooksForRegularMain(
 			{
 				userId: '',
 				workflowData: execution.workflowData,
 				executionMode: execution.mode,
 				executionData: execution.data,
 				runData: execution.data.resultData.runData,
-				retryOf: execution.retryOf,
+				retryOf: execution.retryOf ?? undefined,
 			},
 			execution.id,
 		);
@@ -316,20 +273,25 @@ export class ExecutionRecoveryService {
 			status: execution.status,
 		};
 
-		await externalHooks.executeHookFunctions('workflowExecuteAfter', [run]);
+		await lifecycleHooks.runHook('workflowExecuteAfter', [run]);
 	}
 
-	private toErrorMsg(error: unknown) {
-		return error instanceof Error
-			? error.message
-			: jsonStringify(error, { replaceCircularRefs: true });
-	}
+	private async getAutodeactivationRecipient(workflow: WorkflowEntity): Promise<User> {
+		const project = await this.ownershipService.getWorkflowProjectCached(workflow.id);
 
-	private shouldScheduleQueueRecovery() {
-		return (
-			config.getEnv('executions.mode') === 'queue' &&
-			config.getEnv('multiMainSetup.instanceType') === 'leader' &&
-			!this.isShuttingDown
-		);
+		const roleSlug = project.type === 'team' ? PROJECT_ADMIN_ROLE_SLUG : PROJECT_OWNER_ROLE_SLUG;
+		const projectRelations = await this.projectRelationRepository.find({
+			where: {
+				projectId: project.id,
+				role: { slug: roleSlug },
+			},
+			relations: { user: true },
+		});
+
+		if (projectRelations.length > 0) {
+			return projectRelations[0].user;
+		} else {
+			return await this.ownershipService.getInstanceOwner();
+		}
 	}
 }
